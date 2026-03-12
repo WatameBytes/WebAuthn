@@ -154,6 +154,11 @@ public class AuthenticateController {
         dump.put("verifiedCredentialId",    result.getCredentialId().getBase64Url());
         dump.put("userVerified",            result.isUserVerified());
         dump.put("signCountAfter",          result.getSignatureCount());
+        // signatureCounterValid: false = possible cloned hardware key.
+        // Software authenticators (Bitwarden, iCloud Keychain, 1Password, etc.) always return 0 — this will be true regardless.
+        // signatureCounterValid: false = counter went backwards or stalled on a non-zero value — possible cloned hardware key.
+        // Safe to ignore when signCountAfter == 0: software authenticators (Bitwarden, iCloud Keychain, 1Password) never increment.
+        dump.put("signatureCounterValid",   result.isSignatureCounterValid());
         result.getAuthenticatorAttachment()
                 .ifPresent(a -> dump.put("authenticatorAttachment", a.getValue()));
 
