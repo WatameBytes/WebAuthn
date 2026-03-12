@@ -191,6 +191,16 @@
     <div id="regStatus" class="status info">Enter a username and press Register.</div>
 </div>
 
+<!-- Capabilities card -->
+<div class="card">
+    <h2>Client Capabilities</h2>
+    <button id="capsBtn" onclick="sendCapabilities()">Capture Capabilities</button>
+    <div id="capsStatus" class="status info">Press to log what this browser supports.</div>
+    <div id="capsResult" style="display:none; margin-top:1rem;">
+        <pre class="field-value json-block" id="capsJson" style="display:block"></pre>
+    </div>
+</div>
+
 <!-- Authenticate card -->
 <div class="card">
     <h2>Authenticate (Usernameless)</h2>
@@ -223,11 +233,12 @@
             id:    cred.id,
             rawId: bufferToBase64Url(cred.rawId),
             type:  cred.type,
-            // getClientExtensionResults() returns {} if no extensions — must be present, Yubico marks it @NonNull
+            authenticatorAttachment: cred.authenticatorAttachment ?? null,
             clientExtensionResults: cred.getClientExtensionResults(),
             response: {
                 clientDataJSON:    bufferToBase64Url(cred.response.clientDataJSON),
                 attestationObject: bufferToBase64Url(cred.response.attestationObject),
+                transports:        cred.response.getTransports?.() ?? [],
             }
         };
     }
@@ -341,6 +352,42 @@
                 })
             }
         };
+    }
+
+    async function sendCapabilities() {
+        const btn    = document.getElementById('capsBtn');
+        const status = document.getElementById('capsStatus');
+        const result = document.getElementById('capsResult');
+        const pre    = document.getElementById('capsJson');
+
+        btn.disabled = true;
+        status.className = 'status info';
+        status.textContent = 'Fetching capabilities…';
+
+        try {
+            const caps = await PublicKeyCredential.getClientCapabilities();
+            // caps is a plain object — spread to a regular obj for JSON serialization
+            const capsObj = Object.fromEntries(Object.entries(caps));
+
+            const res = await fetch('/capabilities', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ capabilities: capsObj, userAgent: navigator.userAgent })
+            });
+            if (!res.ok) throw new Error('Server error ' + res.status);
+
+            status.className = 'status ok';
+            status.textContent = '✓ Capabilities captured and logged to file.';
+            pre.textContent = JSON.stringify(capsObj, null, 2);
+            result.style.display = 'block';
+
+        } catch (err) {
+            status.className = 'status error';
+            status.textContent = '✗ ' + (err.message ?? err);
+            console.error(err);
+        } finally {
+            btn.disabled = false;
+        }
     }
 
     async function authenticate() {

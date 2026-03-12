@@ -171,9 +171,21 @@ public class RegisterController {
                 v  -> dump.put("discoverable", v),
                 () -> dump.put("discoverable", "unknown")
         );
-        result.getAuthenticatorAttachment().ifPresent(a ->
-                dump.put("authenticatorAttachment", a.getValue())
+        result.getAuthenticatorAttachment().ifPresentOrElse(
+                a  -> dump.put("authenticatorAttachment", a.getValue()),
+                () -> dump.put("authenticatorAttachment", "not reported") // browser didn't send it
         );
+
+        // Transports — how the authenticator communicates: internal, hybrid, usb, nfc, ble
+        // Only available on registration response, not assertion
+        java.util.SortedSet<AuthenticatorTransport> transports = pkc.getResponse().getTransports();
+        if (transports.isEmpty()) {
+            dump.put("transports", "not reported");
+        } else {
+            com.fasterxml.jackson.databind.node.ArrayNode arr = objectMapper.createArrayNode();
+            transports.forEach(t -> arr.add(t.getId()));
+            dump.set("transports", arr);
+        }
 
         if (attestationStatement.has("x5c")) {
             com.fasterxml.jackson.databind.node.ArrayNode certsDecoded = objectMapper.createArrayNode();
