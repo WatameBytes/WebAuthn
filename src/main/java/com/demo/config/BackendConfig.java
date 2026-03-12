@@ -1,5 +1,6 @@
-package com.demo;
+package com.demo.config;
 
+import com.demo.service.CredentialRepositoryStub;
 import com.yubico.webauthn.RelyingParty;
 import com.yubico.webauthn.data.AttestationConveyancePreference;
 import com.yubico.webauthn.data.RelyingPartyIdentity;

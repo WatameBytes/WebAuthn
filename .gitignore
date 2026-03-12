@@ -1,8 +1,13 @@
 # Attestation dumps
 Info/
+*-*.json
 
 # Maven
 target/
+
+# Gradle
+.gradle/
+build/
 
 # IDE
 .idea/

@@ -191,6 +191,13 @@
     <div id="regStatus" class="status info">Enter a username and press Register.</div>
 </div>
 
+<!-- Authenticate card -->
+<div class="card">
+    <h2>Authenticate (Usernameless)</h2>
+    <button id="authBtn" onclick="authenticate()">Authenticate</button>
+    <div id="authStatus" class="status info">Press Authenticate to trigger a usernameless assertion.</div>
+</div>
+
 <!-- Result card -->
 <div class="card" id="resultCard" style="display:none">
     <h2>Attestation Result</h2>
@@ -316,6 +323,83 @@
         // attestationStatement as pretty JSON
         field('Attestation Statement (decoded attStmt)',
             `<pre class="json-block">${JSON.stringify(data.attestationStatement, null, 2)}</pre>`);
+    }
+
+    function prepareAssertion(cred) {
+        return {
+            id:    cred.id,
+            rawId: bufferToBase64Url(cred.rawId),
+            type:  cred.type,
+            clientExtensionResults: cred.getClientExtensionResults(),
+            response: {
+                clientDataJSON:    bufferToBase64Url(cred.response.clientDataJSON),
+                authenticatorData: bufferToBase64Url(cred.response.authenticatorData),
+                signature:         bufferToBase64Url(cred.response.signature),
+                // userHandle is nullable — only present for discoverable credentials
+                ...(cred.response.userHandle && {
+                    userHandle: bufferToBase64Url(cred.response.userHandle)
+                })
+            }
+        };
+    }
+
+    async function authenticate() {
+        const btn    = document.getElementById('authBtn');
+        const status = document.getElementById('authStatus');
+
+        btn.disabled = true;
+        status.className = 'status info';
+        status.textContent = 'Starting authentication…';
+
+        try {
+            // -- 1. Start --
+            const startRes = await fetch('/authenticate/start', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({})
+            });
+            if (!startRes.ok) throw new Error((await startRes.json()).error);
+            const { assertionId, credentialJson } = await startRes.json();
+
+            // credentialJson is wrapped under "publicKey" from toCredentialsGetJson()
+            const parsed  = JSON.parse(credentialJson);
+            const options = parsed.publicKey ?? parsed;
+            options.challenge = base64UrlToBuffer(options.challenge);
+            if (options.allowCredentials) {
+                options.allowCredentials = options.allowCredentials.map(c => ({
+                    ...c, id: base64UrlToBuffer(c.id)
+                }));
+            }
+
+            status.textContent = 'Waiting for authenticator…';
+
+            // -- 2. Browser prompts the user --
+            const credential = await navigator.credentials.get({ publicKey: options });
+
+            status.textContent = 'Finishing authentication…';
+
+            // -- 3. Finish --
+            const finishRes = await fetch('/authenticate/finish', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    assertionId,
+                    publicKeyCredentialJson: JSON.stringify(prepareAssertion(credential))
+                })
+            });
+            const data = await finishRes.json();
+            if (!finishRes.ok) throw new Error(data.message);
+
+            status.className = 'status ok';
+            status.textContent = '✓ ' + data.message;
+
+        } catch (err) {
+            status.className = 'status error';
+            status.textContent = '✗ ' + (err.message ?? err);
+            console.error(err);
+        } finally {
+            btn.disabled = false;
+        }
     }
 </script>
 

@@ -1,13 +1,16 @@
-package com.demo;
+package com.demo.service;
 
-import com.demo.FinishRequest;
-import com.demo.StartRequest;
+import com.demo.models.FinishRequest;
 
+import com.demo.models.StartRequest;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.yubico.webauthn.AssertionRequest;
 import com.yubico.webauthn.FinishRegistrationOptions;
+import com.yubico.webauthn.RegisteredCredential;
 import com.yubico.webauthn.RelyingParty;
 import com.yubico.webauthn.RegistrationResult;
+import com.yubico.webauthn.StartAssertionOptions;
 import com.yubico.webauthn.StartRegistrationOptions;
 import com.yubico.webauthn.data.*;
 
@@ -26,7 +29,6 @@ import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
 import java.time.Instant;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
@@ -36,17 +38,15 @@ public class RegisterController {
 
     private final RelyingParty relyingParty;
     private final ObjectMapper objectMapper;
+    private final CredentialRepositoryStub credentialRepository;
 
-    // challengeId -> { username, PublicKeyCredentialCreationOptions JSON }
-    // Simple in-memory map — no Cassandra, no JPA needed for this exercise
-    private final ConcurrentHashMap<String, PendingChallenge> pendingChallenges = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, PendingChallenge> pendingRegistrations = new ConcurrentHashMap<>();
 
     private record PendingChallenge(String username, String optionsJson) {}
 
-    // -------------------------------------------------------------------------
-    // POST /registration/start
-    // Body: { "username": "rex" }
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // REGISTRATION — START
+    // =========================================================================
     @PostMapping("/registration/start")
     public ResponseEntity<?> start(@RequestBody StartRequest req) throws Exception {
         String username = req.getUsername();
@@ -54,7 +54,6 @@ public class RegisterController {
             return ResponseEntity.badRequest().body(Map.of("error", "username is required"));
         }
 
-        // User handle — just UTF-8 bytes of the username keeps it readable in the dump
         ByteArray userHandle = new ByteArray(username.getBytes(StandardCharsets.UTF_8));
 
         UserIdentity userIdentity = UserIdentity.builder()
@@ -64,9 +63,8 @@ public class RegisterController {
                 .build();
 
         AuthenticatorSelectionCriteria authenticatorSelection = AuthenticatorSelectionCriteria.builder()
-                //.authenticatorAttachment(AuthenticatorAttachment.CROSS_PLATFORM)
                 .userVerification(UserVerificationRequirement.PREFERRED)
-                .residentKey(ResidentKeyRequirement.REQUIRED)  // ← actually stores a passkey on the device
+                .residentKey(ResidentKeyRequirement.REQUIRED)
                 .build();
 
         PublicKeyCredentialCreationOptions options = relyingParty.startRegistration(
@@ -77,22 +75,20 @@ public class RegisterController {
                         .build());
 
         String registrationId = UUID.randomUUID().toString();
-        pendingChallenges.put(registrationId, new PendingChallenge(username, options.toJson()));
+        pendingRegistrations.put(registrationId, new PendingChallenge(username, options.toJson()));
 
-        // toCredentialsCreateJson() wraps under "publicKey" — that's the shape the browser expects
         return ResponseEntity.ok(Map.of(
                 "registrationId", registrationId,
                 "publicKey", objectMapper.readTree(options.toCredentialsCreateJson())
         ));
     }
 
-    // -------------------------------------------------------------------------
-    // POST /registration/finish
-    // Body: { "registrationId": "...", "publicKeyCredentialString": "<JSON from browser>" }
-    // -------------------------------------------------------------------------
+    // =========================================================================
+    // REGISTRATION — FINISH
+    // =========================================================================
     @PostMapping("/registration/finish")
     public ResponseEntity<?> finish(@RequestBody FinishRequest req) throws Exception {
-        PendingChallenge pending = pendingChallenges.remove(req.getRegistrationId());
+        PendingChallenge pending = pendingRegistrations.remove(req.getRegistrationId());
         if (pending == null) {
             return ResponseEntity.badRequest().body(Map.of("error", "Unknown or expired registrationId"));
         }
@@ -115,102 +111,70 @@ public class RegisterController {
             return ResponseEntity.badRequest().body(Map.of("error", e.getMessage()));
         }
 
-        // -----------------------------------------------------------------
-        // ATTESTATION EXTRACTION
-        // Everything lives on the AttestationObject inside the response
-        // -----------------------------------------------------------------
         AuthenticatorAttestationResponse attestationResponse = pkc.getResponse();
         AttestationObject attestationObject = attestationResponse.getAttestation();
 
-        // fmt — e.g. "packed", "fido-u2f", "tpm", "none"
-        String attestationFormat = attestationObject.getFormat();
-
-        // attStmt — Yubico already CBOR-decoded this into a Jackson ObjectNode for you
-        // For "packed" + YubiKey you'll see: alg (int), sig (bytes), x5c (cert chain)
+        String attestationFormat        = attestationObject.getFormat();
         ObjectNode attestationStatement = attestationObject.getAttestationStatement();
 
-        // AAGUID — getAaguid() returns a raw 16-byte ByteArray; convert to standard GUID string via UUID
         ByteArray aaguidBytes = result.getAaguid();
         ByteBuffer bb = ByteBuffer.wrap(aaguidBytes.getBytes());
         String aaguid = new UUID(bb.getLong(), bb.getLong()).toString();
 
-        // Credential ID — use getBase64Url(), NOT manual Base64.getEncoder()
-        String credentialId = result.getKeyId().getId().getBase64Url();
-
-        // Public key COSE bytes — again, ByteArray gives you getBase64Url() directly
+        String credentialId  = result.getKeyId().getId().getBase64Url();
         String publicKeyCose = result.getPublicKeyCose().getBase64Url();
 
-        // AuthenticatorData flags — AuthenticatorData is not generic
-        AuthenticatorData authData = attestationResponse.getParsedAuthenticatorData();
-
-        // Client data — Lombok generates getClientData() from the clientData field
+        AuthenticatorData   authData   = attestationResponse.getParsedAuthenticatorData();
         CollectedClientData clientData = attestationResponse.getClientData();
 
-        // -----------------------------------------------------------------
-        // Build the dump document
-        // -----------------------------------------------------------------
         ObjectNode dump = objectMapper.createObjectNode();
+        dump.put("flow",              "registration");
         dump.put("timestamp",         Instant.now().toString());
         dump.put("username",          pending.username());
         dump.put("credentialId",      credentialId);
         dump.put("publicKeyCose",     publicKeyCose);
         dump.put("aaguid",            aaguid);
         dump.put("attestationFormat", attestationFormat);
-        dump.set("attestationStatement", attestationStatement);  // full decoded attStmt
+        dump.set("attestationStatement", attestationStatement);
 
-        // Flags
         ObjectNode flags = objectMapper.createObjectNode();
-        flags.put("UP", authData.getFlags().UP); // user present
-        flags.put("UV", authData.getFlags().UV); // user verified
-        flags.put("AT", authData.getFlags().AT); // attested credential data included
-        flags.put("ED", authData.getFlags().ED); // extension data included
+        flags.put("UP", authData.getFlags().UP);
+        flags.put("UV", authData.getFlags().UV);
+        flags.put("AT", authData.getFlags().AT);
+        flags.put("ED", authData.getFlags().ED);
+        flags.put("BE", authData.getFlags().BE);
+        flags.put("BS", authData.getFlags().BS);
         dump.set("authenticatorDataFlags", flags);
         dump.put("signCount", authData.getSignatureCounter());
+        dump.put("rpIdHash",  authData.getRpIdHash().getBase64Url());
 
-        // Attested credential data (nested inside authData)
         authData.getAttestedCredentialData().ifPresent(acd -> {
             ObjectNode acdNode = objectMapper.createObjectNode();
-            // acd.getAaguid() is a raw 16-byte ByteArray — same UUID conversion as result.getAaguid()
             ByteBuffer acdBb = ByteBuffer.wrap(acd.getAaguid().getBytes());
             acdNode.put("aaguid",       new UUID(acdBb.getLong(), acdBb.getLong()).toString());
             acdNode.put("credentialId", acd.getCredentialId().getBase64Url());
             dump.set("attestedCredentialData", acdNode);
         });
 
-        // Client data
         ObjectNode clientDataNode = objectMapper.createObjectNode();
-        clientDataNode.put("type",      clientData.getType()); // getType() returns String directly
+        clientDataNode.put("type",      clientData.getType());
         clientDataNode.put("origin",    clientData.getOrigin());
         clientDataNode.put("challenge", clientData.getChallenge().getBase64Url());
         dump.set("clientData", clientDataNode);
 
-        // -----------------------------------------------------------------
-        // RegistrationResult — extra fields
-        // -----------------------------------------------------------------
-        dump.put("attestationType",    result.getAttestationType().name()); // BASIC, SELF, NONE, ANONYMIZATION_CA, etc.
-        dump.put("attestationTrusted", result.isAttestationTrusted());       // always false without an attestationTrustSource
-        dump.put("userVerified",       result.isUserVerified());             // UV flag
-        dump.put("backupEligible",     result.isBackupEligible());           // BE flag — can this key be synced?
-        dump.put("backedUp",           result.isBackedUp());                 // BS flag — is it currently synced?
+        dump.put("attestationType",    result.getAttestationType().name());
+        dump.put("attestationTrusted", result.isAttestationTrusted());
+        dump.put("userVerified",       result.isUserVerified());
+        dump.put("backupEligible",     result.isBackupEligible());
+        dump.put("backedUp",           result.isBackedUp());
         result.isDiscoverable().ifPresentOrElse(
                 v  -> dump.put("discoverable", v),
-                () -> dump.put("discoverable", "unknown") // only known if credProps extension present
+                () -> dump.put("discoverable", "unknown")
         );
         result.getAuthenticatorAttachment().ifPresent(a ->
-                dump.put("authenticatorAttachment", a.getValue())               // "platform" or "cross-platform"
+                dump.put("authenticatorAttachment", a.getValue())
         );
 
-        // rpIdHash from authenticator data (SHA-256 of the RP ID — should match hash of "localhost")
-        dump.put("rpIdHash", authData.getRpIdHash().getBase64Url());
-
-        // BE / BS flags directly from authData flags
-        ObjectNode extraFlags = objectMapper.createObjectNode();
-        extraFlags.put("BE", authData.getFlags().BE); // backup eligible
-        extraFlags.put("BS", authData.getFlags().BS); // backup state
-        dump.set("authenticatorDataFlagsExtra", extraFlags);
-
-        // Decoded x5c certificate chain — subject, issuer, serial, validity per cert
-        // The raw certs are already in attestationStatement.x5c, but decoded they're much more readable
         if (attestationStatement.has("x5c")) {
             com.fasterxml.jackson.databind.node.ArrayNode certsDecoded = objectMapper.createArrayNode();
             for (com.fasterxml.jackson.databind.JsonNode certNode : attestationStatement.get("x5c")) {
@@ -219,7 +183,6 @@ public class RegisterController {
                     java.security.cert.X509Certificate cert = (java.security.cert.X509Certificate)
                             java.security.cert.CertificateFactory.getInstance("X.509")
                                     .generateCertificate(new java.io.ByteArrayInputStream(certBytes));
-
                     ObjectNode certInfo = objectMapper.createObjectNode();
                     certInfo.put("subject",      cert.getSubjectX500Principal().getName());
                     certInfo.put("issuer",       cert.getIssuerX500Principal().getName());
@@ -235,7 +198,6 @@ public class RegisterController {
             dump.set("x5cDecoded", certsDecoded);
         }
 
-        // Attestation trust path (only populated if attestationTrustSource is configured on the RP)
         result.getAttestationTrustPath().ifPresent(chain -> {
             com.fasterxml.jackson.databind.node.ArrayNode trustPath = objectMapper.createArrayNode();
             for (java.security.cert.X509Certificate cert : chain) {
@@ -249,12 +211,24 @@ public class RegisterController {
             dump.set("attestationTrustPath", trustPath);
         });
 
-        writeDumpToFile(dump, pending.username());
+        writeDumpToFile(dump, "registration-" + pending.username());
 
-        log.info("username={} aaguid={} format={} attestationType={} credentialId={}",
+        // Store in repository so finishAssertion() can look it up
+        ByteArray userHandle = new ByteArray(pending.username().getBytes(StandardCharsets.UTF_8));
+        credentialRepository.storeCredential(
+                pending.username(),
+                userHandle,
+                RegisteredCredential.builder()
+                        .credentialId(result.getKeyId().getId())
+                        .userHandle(userHandle)
+                        .publicKeyCose(result.getPublicKeyCose())
+                        .signatureCount(result.getSignatureCount())
+                        .build()
+        );
+
+        log.info("[REGISTRATION] username={} aaguid={} format={} type={} credentialId={}",
                 pending.username(), aaguid, attestationFormat, result.getAttestationType().name(), credentialId);
 
-        // Return the key fields in the response so you can also see them in the browser
         ObjectNode response = objectMapper.createObjectNode();
         response.put("status",            "ok");
         response.put("username",          pending.username());
@@ -266,18 +240,18 @@ public class RegisterController {
         return ResponseEntity.ok(response);
     }
 
-    private void writeDumpToFile(ObjectNode dump, String username) {
+    // =========================================================================
+    // File dump — flow+username prefix, timestamped so nothing overwrites
+    // =========================================================================
+    private void writeDumpToFile(ObjectNode dump, String label) {
         try {
-            // File named after the username — easy to find after registering a real key
-            // Append timestamp so multiple registrations for the same user don't overwrite
             String timestamp = Instant.now().toString().replace(":", "-").replace(".", "-");
-            Path dumpFile = Path.of(username + "-" + timestamp + ".json");
-
+            Path dumpFile = Path.of(label + "-" + timestamp + ".json");
             String content = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(dump);
             Files.writeString(dumpFile, content, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
-            log.info("Attestation written to {}", dumpFile.toAbsolutePath());
+            log.info("Dump written to {}", dumpFile.toAbsolutePath());
         } catch (IOException e) {
-            log.error("Failed to write attestation dump", e);
+            log.error("Failed to write dump", e);
         }
     }
 }
